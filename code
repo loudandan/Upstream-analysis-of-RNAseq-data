@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# 指定下载的SRR列表txt文件所在位置
+input_folder="/dsk2/who/zhaomz/data/test"
+
+# 指定输出文件夹
+output_folder="/dsk2/who/zhaomz/data/test/result"
+
+#指定从ncbi上边下载的原始文件的输出文件夹
+sra="$output_folder/sra"
+
+#sra转fastq并压缩成gz格式的输出文件夹
+fastq="$output_folder/fastq"
+fastq_gz="$output_folder/gz"
+
+# 指定fastp报告的输出文件夹
+fastp_report_folder="$output_folder/fastp_reports"
+
+#指定fastp质控后的输出文件夹
+cleaned_folder="$output_folder/cleaned_folder"
+
+#指定去除rRNA后的输出文件夹
+rRNA_remove="$output_folder/rRNA_remove"
+
+#指定比对后的sam再排序后的bam文件的输出文件夹
+sort_bam="$output_folder/sort_bam"
+
+#指定组装好的转录本的gtf文件的输出文件夹
+gtf="$output_folder/gtf"
+
+# 创建输出文件夹（如果不存在）
+mkdir -p "$output_folder"
+
+#创建sra输出文件夹（如果不存在）
+mkdir -p "$sra"
+
+#创建gz格式输出文件夹（如果不存在）
+mkdir -p "$fastq"
+mkdir -p "$fastq_gz"
+
+# 创建fastp报告输出文件夹（如果不存在）
+mkdir -p "$fastp_report_folder"
+
+#创建fastp质控后的输出文件夹（如果不存在）
+mkdir -p "$cleaned_folder"
+
+#创建移除rRNA后的输出文件夹（如果不存在）
+mkdir -p "$rRNA_remove"
+
+#创建排序后的bam文件的输出文件夹（如果不存在）
+mkdir -p "$sort_bam"
+
+#创建gtf文件的输出文件夹（如果不存在）
+mkdir -p "$gtf"
+
+#prefetch从ncbi上下载原始数据
+cd "$input_folder"
+prefetch --option-file download.txt
+
+#将下载的SRR数据移动到同一个文件夹下边
+find "$input_folder/" -type f -name "*.sra" -exec mv {} "$sra/" \;
+
+#faster-dump将sra转为fastq
+for sra_file in "$sra"/*.sra; do
+  fasterq-dump --split-3 "$sra_file" -e 10 -O "$fastq"
+done
+
+#压缩
+for fastq_file in "$fastq"/*.fastq; do
+  file_name=$(basename "$fastq_file")
+  gzip -c "$fastq_file" > "$fastq_gz/${file_name}.gz"
+done
+
+# 质控和质控报告（使用fastp）
+for forward_read in "$fastq_gz"/*_1.fastq.gz; do
+  reverse_read="${forward_read%_1.fastq.gz}_2.fastq.gz"
+  
+  sample_name=$(basename "$forward_read" | cut -d '_' -f 1)
+  
+  fastp -i "$forward_read" -I "$reverse_read" -o "$cleaned_folder/${sample_name}_cleaned_1.fastq.gz" -O "$cleaned_folder/${sample_name}_cleaned_2.fastq.gz" --html "$fastp_report_folder/${sample_name}_fastp_report.html" -q 20 -l 25 --thread 16 --trim_front1 12
+done
+
+# 去除rRNA
+for cleaned_forward_read in "$cleaned_folder"/*_cleaned_1.fastq.gz; do
+  cleaned_reverse_read="${cleaned_forward_read%_cleaned_1.fastq.gz}_cleaned_2.fastq.gz"
+  sample_name=$(basename "$cleaned_forward_read" | cut -d '_' -f 1)
+
+  bowtie2 -p 32 -x /dsk2/who/zhaomz/index/rRNA_index -1 "$cleaned_forward_read" -2 "$cleaned_reverse_read" --un-conc-gz "$rRNA_remove/${sample_name}.fq.gz"
+done
+
+#重命名去除rRNA后的gz文件
+for file in "$rRNA_remove"/*.fq.1.gz; do
+ mv -- "$file" "${file%.fq.1.gz}_1.fq.gz"
+done
+for file in "$rRNA_remove"/*.fq.2.gz; do 
+ mv -- "$file" "${file%.fq.2.gz}_2.fq.gz" 
+done
+
+#hisat2比对并转成bam格式并排序
+for forward_read in "$rRNA_remove"/*_1.fq.gz; do
+  reverse_read="${forward_read%_1.fq.gz}_2.fq.gz"
+  
+  sample_name=$(basename "$forward_read" | cut -d '_' -f 1)
+  
+  hisat2 -t -p 32 -x /dsk2/who/zhaomz/hushixiong/data/index/genome_tran -1 "$forward_read" -2 "$reverse_read" | samtools view -@ 24 -b -S | samtools sort -@ 24 -o "$sort_bam/${sample_name}.sort.bam"
+done
+
+#stringtie组装转录本
+for bam_file in "$sort_bam"/*.sort.bam; do
+  sample_name=$(basename "$bam_file" | cut -d '.' -f 1)
+   stringtie "$bam_file" -G /dsk2/who/zhaomz/data/Nl.gtf -o "$gtf/${sample_name}.gtf" -p 16
+done
+
